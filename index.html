@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Quotex Live Predictor — Pro</title>
+<link rel="icon" href="data:,"/>
+<style>
+  :root{
+    --bg:#0f1724; --card:#0b1220; --muted:#9aa6bf; --accent:#00d4ff; --up:#22c55e; --down:#ff6b6b;
+    --glass: rgba(255,255,255,0.03);
+  }
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Arial,sans-serif;background:linear-gradient(180deg,#091021 0%, #071220 100%);color:var(--muted);-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:1100px;margin:12px auto;padding:12px;}
+  header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+  h1{color:#e6f7ff;font-size:18px;margin:0}
+  .sub{font-size:13px;color:var(--muted)}
+  .grid{display:grid;grid-template-columns:1fr;gap:12px}
+  @media(min-width:900px){ .grid{grid-template-columns:repeat(3,1fr)} }
+  .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:12px;padding:12px;box-shadow:0 6px 30px rgba(1,6,12,0.6);border:1px solid rgba(255,255,255,0.03)}
+  .title{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .pair{font-weight:700;color:#e6fbff}
+  .meta{font-size:12px;color:var(--muted)}
+  .chart{height:180px;margin-bottom:8px;border-radius:8px;background:linear-gradient(180deg, rgba(0,0,0,0.12), rgba(255,255,255,0.01));display:flex;align-items:center;justify-content:center;color:#6b7280;font-size:13px}
+  .stats{display:flex;justify-content:space-between;gap:8px;font-size:13px;margin-top:6px}
+  .pred{font-weight:800}
+  .pred.up{color:var(--up)}
+  .pred.down{color:var(--down)}
+  .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+  button{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.04);color:var(--muted);padding:8px 10px;border-radius:8px;cursor:pointer}
+  .badge{font-size:12px;padding:6px;border-radius:8px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.02);color:var(--muted)}
+  footer{margin-top:14px;font-size:12px;color:var(--muted);text-align:center}
+  .conf{font-weight:700;color:var(--accent)}
+  a.link{color:var(--accent);text-decoration:none}
+  .small{font-size:12px;color:var(--muted)}
+  .notice{font-size:12px;color:#ffd1a9;background:rgba(255,210,169,0.04);padding:8px;border-radius:8px;margin-bottom:10px}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Quotex Live Predictor — Pro</h1>
+        <div class="sub">EMA(9/21) + RSI(14) + MACD — 3 pairs • 1-minute auto-update • Mobile friendly</div>
+      </div>
+      <div style="text-align:right">
+        <div class="badge" id="status">Status: idle</div>
+        <div style="height:6px"></div>
+        <div class="small">Next update in <span id="countdown">--</span>s</div>
+      </div>
+    </header>
+
+    <div class="notice">This package is ready to deploy on Netlify/Vercel. It uses a small serverless proxy function at <code>/.netlify/functions/proxy</code> to avoid CORS. Deploy both the site and functions together.</div>
+
+    <div class="grid" id="grid"></div>
+
+    <div class="controls">
+      <button id="toggleAuto">Auto: ON</button>
+      <button id="refreshNow">Refresh Now</button>
+      <button id="downloadSnapshot">Download Snapshot</button>
+      <div class="small">Live sources: Yahoo Finance (forex) → Binance (crypto) → CryptoCompare fallback</div>
+    </div>
+
+    <footer>Use signals at your own risk. Backtest before trading. <a class="link" href="#">Docs</a></footer>
+  </div>
+
+<script>
+/* CONFIG */
+const PAIRS = [
+  {name:'EUR/USD', yahoo:'EURUSD=X', binance:'EURUSDT', type:'forex'},
+  {name:'GBP/JPY', yahoo:'GBPJPY=X', binance:'GBPJPY', type:'forex'},
+  {name:'BTC/USDT', yahoo:'BTC-USD', binance:'BTCUSDT', type:'crypto'}
+];
+const UPDATE_INTERVAL = 60; // seconds
+const MIN_CANDLES = 50; // require at least 50 1-min candles for better signal
+
+/* STATE */
+const state = {};
+let autoOn = true;
+let countdown = UPDATE_INTERVAL;
+let timer = null;
+
+/* MATH HELPERS */
+function ema(values, period){ if(!values.length) return []; const k=2/(period+1); let prev=values[0]; const out=[prev]; for(let i=1;i<values.length;i++){ prev=(values[i]-prev)*k+prev; out.push(prev);} return out; }
+function rsi(closes, period=14){ if(closes.length < period+1) return null; let gains=0, losses=0; for(let i=1;i<closes.length;i++){ const d=closes[i]-closes[i-1]; if(d>0) gains+=d; else losses+=Math.abs(d);} const avgGain=gains/period, avgLoss=losses/period; if(avgLoss===0) return 100; const rs=avgGain/avgLoss; return Math.round((100 - (100/(1+rs)))*10)/10; }
+function macdSeries(closes){ if(closes.length<26) return null; const ema12 = ema(closes,12); const ema26 = ema(closes,26); const macd = ema12.map((v,i)=> v - (ema26[i]||0)); const signal = ema(macd.slice(-30),9); return {macd, signal: signal.length?signal[signal.length-1]:null}; }
+
+/* DOM create */
+function createCards(){
+  const grid = document.getElementById('grid');
+  PAIRS.forEach(p=>{
+    const sym = p.yahoo;
+    const card = document.createElement('div'); card.className='card';
+    card.innerHTML = `
+      <div class="title"><div class="pair">${p.name}</div><div class="meta" id="${sym}-time">--:--</div></div>
+      <div id="${sym}-chart" class="chart">Chart</div>
+      <div class="stats"><div id="${sym}-last">Last: —</div><div id="${sym}-pred">Pred: —</div></div>
+      <div class="stats" style="margin-top:6px"><div id="${sym}-ema">EMA9/21: —</div><div id="${sym}-rsi">RSI: —</div></div>
+      <div style="margin-top:8px;display:flex;gap:8px"><button id="${sym}-manual">Manual Price</button><button id="${sym}-hist">History</button></div>
+    `;
+    grid.appendChild(card);
+    state[sym] = {pair:p, candles:[], lastFetch:null};
+    document.getElementById(sym+'-manual').addEventListener('click', ()=>manualPrice(sym));
+    document.getElementById(sym+'-hist').addEventListener('click', ()=>showHistory(sym));
+  });
+}
+
+/* FETCH HELPERS - use proxy first to avoid CORS */
+async function fetchProxy(url){
+  try{
+    const proxyUrl = '/.netlify/functions/proxy?url=' + encodeURIComponent(url);
+    const res = await fetch(proxyUrl);
+    if(!res.ok) throw new Error('proxy '+res.status);
+    const text = await res.text();
+    return JSON.parse(text);
+  }catch(err){ console.warn('proxy fail', err); return null; }
+}
+
+async function fetchYahoo(symbol){
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`;
+  // try proxy first
+  const viaProxy = await fetchProxy(url);
+  if(viaProxy) return parseYahoo(viaProxy);
+  // fallback direct
+  try{
+    const r = await fetch(url);
+    if(!r.ok) throw new Error('yahoo '+r.status);
+    const j = await r.json(); return parseYahoo(j);
+  }catch(e){ console.warn('yahoo direct fail', e); return null; }
+}
+function parseYahoo(j){
+  try{
+    const r = j.chart.result[0];
+    const ts = r.timestamp; const q = r.indicators.quote[0];
+    const out = [];
+    for(let i=0;i<ts.length;i++){
+      if(q.close[i]===null) continue;
+      out.push({time: ts[i], open:q.open[i], high:q.high[i], low:q.low[i], close:q.close[i], volume:q.volume? q.volume[i]:0});
+    }
+    return out;
+  }catch(e){ return null; }
+}
+
+async function fetchBinance(symbol){
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=500`;
+  const viaProxy = await fetchProxy(url);
+  if(viaProxy) return parseBinance(viaProxy);
+  try{
+    const r = await fetch(url);
+    if(!r.ok) throw new Error('bin '+r.status);
+    const j = await r.json(); return parseBinance(j);
+  }catch(e){ console.warn('binance fail', e); return null; }
+}
+function parseBinance(arr){
+  try{
+    return arr.map(k=>({time: Math.floor(k[0]/1000), open: +k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5]}));
+  }catch(e){ return null; }
+}
+
+/* UPDATE + PREDICT */
+function computePrediction(candles){
+  if(!candles || candles.length < MIN_CANDLES) return {pred:'NEED_DATA', confidence:0};
+  const closes = candles.map(c=>c.close);
+  const ema9 = ema(closes,9), ema21 = ema(closes,21);
+  const lastIdx = closes.length-1;
+  const lastEMA9 = ema9[lastIdx], lastEMA21 = ema21[lastIdx];
+  const last = candles[lastIdx], prev = candles[lastIdx-1];
+  const body = Math.abs(last.close - last.open), range = (last.high-last.low) || 1e-9;
+  const bodyRatio = body / range;
+  let pred='NEUTRAL'; let conf = Math.min(99, Math.abs(lastEMA9-lastEMA21)*1000 + bodyRatio*60);
+  const r = rsi(closes,14); const mac = macdSeries(closes);
+  const avgVol = candles.slice(-15).reduce((a,b)=>a+b.volume,0)/Math.min(15,candles.length);
+  const volBoost = (last.volume > avgVol) ? 1.2 : 1.0;
+  const macdVal = mac ? mac.macd[mac.macd.length-1] : null; const macSignal = mac? mac.signal : null;
+  if(lastEMA9 > lastEMA21 && last.close > last.open && r !== null && r > 55 && macdVal !== null && macdVal > macSignal) pred='UP';
+  else if(lastEMA9 < lastEMA21 && last.close < last.open && r !== null && r < 45 && macdVal !== null && macdVal < macSignal) pred='DOWN';
+  else { if(last.close > prev.close){ pred='UP'; conf*=0.65 } else if(last.close < prev.close){ pred='DOWN'; conf*=0.65 } else pred='NEUTRAL'; }
+  if(bodyRatio < 0.22) conf *= 0.7; conf *= volBoost; conf = Math.round(conf);
+  return {pred, confidence:conf, lastEMA9, lastEMA21, rsi:r, macdVal, macSignal, last};
+}
+
+function render(sym){
+  const s = state[sym]; if(!s.candles.length) return;
+  const last = s.candles[s.candles.length-1]; const res = computePrediction(s.candles);
+  document.getElementById(sym+'-time').textContent = new Date(last.time*1000).toLocaleTimeString();
+  document.getElementById(sym+'-last').textContent = 'Last: ' + Number(last.close).toFixed(5);
+  document.getElementById(sym+'-ema').textContent = 'EMA9:'+ (res.lastEMA9?res.lastEMA9.toFixed(5):'—') + ' 21:'+ (res.lastEMA21?res.lastEMA21.toFixed(5):'—');
+  document.getElementById(sym+'-rsi').textContent = 'RSI: ' + (res.rsi!==null?res.rsi:'—');
+  const predEl = document.getElementById(sym+'-pred');
+  if(res.pred==='UP') predEl.innerHTML = 'Pred: <span class="pred up">UP ↑</span> <span class="conf">('+res.confidence+'%)</span>';
+  else if(res.pred==='DOWN') predEl.innerHTML = 'Pred: <span class="pred down">DOWN ↓</span> <span class="conf">('+res.confidence+'%)</span>';
+  else predEl.innerHTML = 'Pred: <span class="pred neutral">NEUTRAL</span>';
+  // draw simple spark for recent closes
+  const closes = s.candles.slice(-20).map(c=>c.close); const min=Math.min(...closes), max=Math.max(...closes);
+  const spark = closes.map(v=>{ const pos = Math.round((v-min)/(max-min||1)*7); return '▁▂▃▄▅▆▇█'[Math.max(0,Math.min(7,pos))]; }).join('');
+  document.getElementById(sym+'-chart').textContent = spark + '  ' + Number(last.close).toFixed(5);
+}
+
+async function updatePair(sym){
+  const s = state[sym]; const p = s.pair;
+  // try Yahoo first for forex/crypto (Yahoo often has BTC-USD)
+  let data = await fetchYahoo(p.yahoo);
+  if(data && data.length >= MIN_CANDLES){ s.candles = data.slice(-200); render(sym); return; }
+  // try Binance for crypto/alt (map pair.binance)
+  if(p.binance){
+    const bin = await fetchBinance(p.binance);
+    if(bin && bin.length >= MIN_CANDLES){ s.candles = bin.slice(-200); render(sym); return; }
+  }
+  // if all fail, keep previous or return null
+  console.warn('all sources failed for', sym);
+}
+
+async function updateAll(){
+  document.getElementById('status').textContent = 'Status: updating...';
+  for(const sym in state){ await updatePair(sym); }
+  document.getElementById('status').textContent = 'Status: idle';
+}
+
+/* UI helpers */
+function manualPrice(sym){ const v = prompt('Enter price for '+sym); const p = parseFloat(v); if(isNaN(p)) return; const s = state[sym]; const now = Math.floor(Date.now()/1000); const last = s.candles[s.candles.length-1]; if(last && Math.floor(last.time/60)===Math.floor(now/60)){ last.close = p; last.high = Math.max(last.high,p); last.low = Math.min(last.low,p); last.volume=(last.volume||0)+1; } else s.candles.push({time:now,open:p,high:p,low:p,close:p,volume:1}); render(sym); }
+function showHistory(sym){ const s=state[sym]; if(!s.candles.length) return alert('No data'); const lines = s.candles.slice(-30).map(c=> new Date(c.time*1000).toLocaleTimeString() + ' O:'+c.open.toFixed(5)+' C:'+c.close.toFixed(5)); alert(lines.join('\\n')); }
+
+/* countdown & autosync */
+function startAuto(){ if(timer) clearInterval(timer); timer = setInterval(()=>{ countdown--; if(countdown<=0){ updateAll(); countdown = UPDATE_INTERVAL;} document.getElementById('countdown').textContent = countdown; },1000); }
+function stopAuto(){ if(timer) clearInterval(timer); timer=null; }
+function toggleAuto(){ autoOn = !autoOn; document.getElementById('toggleAuto').textContent = 'Auto: ' + (autoOn? 'ON':'OFF'); if(autoOn) startAuto(); else stopAuto(); }
+document.getElementById('toggleAuto')?.addEventListener('click', toggleAuto);
+
+/* init */
+createCards();
+for(const sym in state){} // ensure state keys (we fill next)
+Object.keys(state).length || Object.assign(state, {});
+PAIRS.forEach(p=>{ state[p.yahoo] = {pair:p, candles:[]}; });
+// initial fetch and loop
+updateAll();
+countdown = UPDATE_INTERVAL; document.getElementById('countdown').textContent = countdown;
+startAuto();
+document.getElementById('refreshNow').addEventListener('click', ()=>{ updateAll(); countdown = UPDATE_INTERVAL; });
+document.getElementById('downloadSnapshot').addEventListener('click', ()=>{ const payload = {state}; const blob = new Blob([JSON.stringify(payload)], {type:'application/json'}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'quotex_snapshot_'+Date.now()+'.json'; a.click(); });
+
+</script>
+</body>
+</html>
